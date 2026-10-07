@@ -68,6 +68,23 @@ def test_get_existing_value(cli, dotenv_path):
     assert (result.exit_code, result.output) == (0, "b\n")
 
 
+def test_get_empty_string_value(cli, dotenv_path):
+    """Empty string values must not be treated as missing (truthiness trap)."""
+    dotenv_path.write_text("a=\n")
+
+    result = cli.invoke(dotenv_cli, ["--file", dotenv_path, "get", "a"])
+
+    assert (result.exit_code, result.output) == (0, "\n")
+
+
+def test_get_value_without_equals(cli, dotenv_path):
+    dotenv_path.write_text("a")
+
+    result = cli.invoke(dotenv_cli, ["--file", dotenv_path, "get", "a"])
+
+    assert (result.exit_code, result.output) == (1, "")
+
+
 def test_get_non_existent_value(cli, dotenv_path):
     result = cli.invoke(dotenv_cli, ["--file", dotenv_path, "get", "a"])
 
@@ -174,6 +191,40 @@ def test_set_no_file(cli):
     assert "Missing argument" in result.output
 
 
+def test_set_missing_directory(cli, tmp_path):
+    dotenv_path = tmp_path / "nx_dir" / ".env"
+
+    result = cli.invoke(dotenv_cli, ["--file", dotenv_path, "set", "a", "b"])
+
+    assert (result.exit_code, result.output) == (
+        2,
+        f"Error writing env file: [Errno 2] No such file or directory: {str(dotenv_path)!r}\n",
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0,
+    reason="Directory permissions are not enforced on Windows or for root.",
+)
+def test_unset_read_only_directory(cli, tmp_path):
+    directory = tmp_path / "ro"
+    directory.mkdir()
+    dotenv_path = directory / ".env"
+    dotenv_path.write_text("a=b\n")
+    directory.chmod(0o555)
+
+    try:
+        result = cli.invoke(dotenv_cli, ["--file", dotenv_path, "unset", "a"])
+    finally:
+        directory.chmod(0o755)
+
+    assert (result.exit_code, result.output) == (
+        2,
+        f"Error writing env file: [Errno 13] Permission denied: {str(dotenv_path)!r}\n",
+    )
+    assert dotenv_path.read_text() == "a=b\n"
+
+
 def test_get_default_path(tmp_path):
     (tmp_path / ".env").write_text("A=x")
 
@@ -263,6 +314,34 @@ def test_run_with_other_env(dotenv_path, tmp_path):
     )
 
     check_process(result, exit_code=0, stdout="x\n")
+
+
+@pytest.mark.parametrize(
+    "args,expected_stdout,expected_content",
+    [
+        (["list"], "a=x\n", "a=x\n"),
+        (["get", "a"], "x\n", "a=x\n"),
+        (["set", "b", "y"], "b=y\n", "a=x\nb='y'\n"),
+        (["unset", "a"], "Successfully removed a\n", ""),
+        (
+            ["run", sys.executable, "-c", "import os; print(os.environ['a'])"],
+            "x\n",
+            "a=x\n",
+        ),
+    ],
+    ids=["list", "get", "set", "unset", "run"],
+)
+def test_file_option_expands_user(tmp_path, args, expected_stdout, expected_content):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("a=x\n")
+    env = {**os.environ, "HOME": str(home), "USERPROFILE": str(home)}
+
+    result = run_dotenv(["--file", "~/.env", *args], cwd=tmp_path, env=env)
+
+    check_process(result, exit_code=0, stdout=expected_stdout)
+    assert (home / ".env").read_text() == expected_content
+    assert sorted(tmp_path.iterdir()) == [home]
 
 
 def test_run_without_cmd(tmp_path):

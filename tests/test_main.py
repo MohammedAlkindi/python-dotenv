@@ -1,6 +1,7 @@
 import io
 import logging
 import os
+import pathlib
 import stat
 import subprocess
 import sys
@@ -204,6 +205,184 @@ def test_set_key_permission_error(dotenv_path):
     else:
         dotenv_path.chmod(0o600)
     assert dotenv_path.read_text() == ""
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" and os.geteuid() == 0,
+    reason="Root user can access files even with 000 permissions.",
+)
+def test_set_key_permission_error_leaves_no_temp_file(dotenv_path):
+    if sys.platform == "win32":
+        # On Windows, make file read-only
+        dotenv_path.chmod(stat.S_IREAD)
+    else:
+        # On Unix, remove all permissions
+        dotenv_path.chmod(0o000)
+
+    try:
+        with pytest.raises(PermissionError):
+            dotenv.set_key(dotenv_path, "a", "b")
+
+        assert list(dotenv_path.parent.glob(".tmp_*")) == []
+    finally:
+        # Restore permissions
+        if sys.platform == "win32":
+            dotenv_path.chmod(stat.S_IWRITE | stat.S_IREAD)
+        else:
+            dotenv_path.chmod(0o600)
+
+
+def test_rewrite_reports_original_error_when_cleanup_fails(dotenv_path, caplog):
+    replace_error = OSError("replace failed")
+
+    with mock.patch("dotenv.main.os.replace", side_effect=replace_error):
+        with mock.patch.object(
+            pathlib.Path, "unlink", side_effect=OSError("unlink failed")
+        ):
+            with pytest.raises(OSError) as excinfo:
+                dotenv.set_key(dotenv_path, "a", "b")
+
+    assert excinfo.value is replace_error
+    [temp_file] = dotenv_path.parent.glob(".tmp_*")
+    assert caplog.messages == [
+        f"python-dotenv could not remove the temporary file {temp_file}"
+    ]
+
+
+def test_set_key_missing_directory(tmp_path):
+    dotenv_path = tmp_path / "nx_dir" / ".env"
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        dotenv.set_key(dotenv_path, "a", "b")
+
+    assert exc_info.value.filename == str(dotenv_path)
+    assert not dotenv_path.parent.exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0,
+    reason="Directory permissions are not enforced on Windows or for root.",
+)
+def test_set_key_read_only_directory(tmp_path):
+    directory = tmp_path / "ro"
+    directory.mkdir()
+    dotenv_path = directory / ".env"
+    dotenv_path.write_text("a=x\n")
+    directory.chmod(0o555)
+
+    try:
+        with pytest.raises(PermissionError) as exc_info:
+            dotenv.set_key(dotenv_path, "a", "y")
+    finally:
+        directory.chmod(0o755)
+
+    assert exc_info.value.filename == str(dotenv_path)
+    assert dotenv_path.read_text() == "a=x\n"
+    assert list(directory.iterdir()) == [dotenv_path]
+
+
+def windows_read_only_semantics(path):
+    # On Windows, a file without the owner-write bit can't be replaced or deleted.
+    return path.exists() and not path.stat().st_mode & stat.S_IWUSR
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        lambda path: dotenv.set_key(path, "a", "y"),
+        lambda path: dotenv.unset_key(path, "a"),
+    ],
+    ids=["set_key", "unset_key"],
+)
+def test_rewrite_read_only_file_leaves_no_temp_file(tmp_path, rewrite):
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_text("a=x\n")
+    dotenv_path.chmod(stat.S_IREAD)
+    real_replace = os.replace
+    real_unlink = pathlib.Path.unlink
+
+    def replace(src, dst):
+        if windows_read_only_semantics(pathlib.Path(dst)):
+            raise PermissionError(
+                13, "Access is denied", os.fspath(src), None, os.fspath(dst)
+            )
+        real_replace(src, dst)
+
+    def unlink(self, missing_ok=False):
+        if windows_read_only_semantics(self):
+            raise PermissionError(13, "Access is denied", str(self))
+        real_unlink(self, missing_ok=missing_ok)
+
+    with mock.patch("dotenv.main.os.replace", side_effect=replace):
+        with mock.patch.object(pathlib.Path, "unlink", unlink):
+            with pytest.raises(PermissionError) as exc_info:
+                rewrite(dotenv_path)
+
+    dotenv_path.chmod(stat.S_IREAD | stat.S_IWRITE)
+    assert exc_info.value.filename2 == str(dotenv_path)
+    assert dotenv_path.read_text() == "a=x\n"
+    assert list(tmp_path.iterdir()) == [dotenv_path]
+
+
+@pytest.mark.parametrize("path_type", [str, pathlib.Path])
+@pytest.mark.parametrize(
+    "call,expected_result,expected_content",
+    [
+        (lambda path: dotenv.dotenv_values(path), {"a": "x"}, "a=x\n"),
+        (lambda path: dotenv.get_key(path, "a"), "x", "a=x\n"),
+        (lambda path: dotenv.set_key(path, "b", "y"), (True, "b", "y"), "a=x\nb='y'\n"),
+        (lambda path: dotenv.unset_key(path, "a"), (True, "a"), ""),
+    ],
+    ids=["dotenv_values", "get_key", "set_key", "unset_key"],
+)
+def test_dotenv_path_expands_user(
+    tmp_path, monkeypatch, path_type, call, expected_result, expected_content
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("a=x\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    result = call(path_type("~/.env"))
+
+    assert result == expected_result
+    assert (home / ".env").read_text() == expected_content
+    assert sorted(tmp_path.iterdir()) == [home]
+
+
+@mock.patch.dict(os.environ, {}, clear=True)
+def test_load_dotenv_expands_user(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("a=x\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    result = dotenv.load_dotenv("~/.env")
+
+    assert result is True
+    assert os.environ["a"] == "x"
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("~/.env", "{home}/.env"),
+        (pathlib.Path("~/.env"), pathlib.Path("{home}/.env")),
+        (".env", ".env"),
+        (None, None),
+    ],
+)
+def test_dotenv_path_keeps_type(tmp_path, monkeypatch, path, expected):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    if expected is not None:
+        expected = type(expected)(str(expected).format(home=tmp_path))
+
+    result = DotEnv(path).dotenv_path
+
+    assert result == expected
+    assert type(result) is type(expected)
 
 
 def test_get_key_no_file(tmp_path):
@@ -432,6 +611,19 @@ def test_find_dotenv_found(tmp_path):
     result = dotenv.find_dotenv(usecwd=True)
 
     assert result == str(dotenv_path)
+
+
+def test_find_dotenv_expands_user(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("a=x\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    result = dotenv.find_dotenv("~/.env", usecwd=True)
+
+    assert result == f"{home}/.env"
 
 
 @pytest.mark.skipif(

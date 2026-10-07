@@ -50,6 +50,10 @@ class DotEnv:
         override: bool = True,
     ) -> None:
         self.dotenv_path: Optional[StrPath] = dotenv_path
+        if isinstance(dotenv_path, str):
+            self.dotenv_path = os.path.expanduser(dotenv_path)
+        elif dotenv_path is not None:
+            self.dotenv_path = pathlib.Path(dotenv_path).expanduser()
         self.stream: Optional[IO[str]] = stream
         self._dict: Optional[Dict[str, Optional[str]]] = None
         self.verbose: bool = verbose
@@ -135,6 +139,25 @@ def get_key(
     return DotEnv(dotenv_path, verbose=True, encoding=encoding).get(key_to_get)
 
 
+def _discard_temp_file(path: pathlib.Path) -> None:
+    """
+    Delete `rewrite`'s temporary file, ignoring any failure to do so.
+
+    This runs while another exception is propagating, so it must not raise:
+    that error is the one worth reporting. On Windows, a file whose mode has
+    no owner-write bit carries the read-only attribute and can't be unlinked,
+    so the mode is reset before a second attempt.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        try:
+            path.chmod(stat.S_IWRITE | stat.S_IREAD)
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("python-dotenv could not remove the temporary file %s", path)
+
+
 @contextmanager
 def rewrite(
     path: StrPath,
@@ -160,13 +183,21 @@ def rewrite(
         source = io.StringIO("")
         original_mode = None
 
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding=encoding,
-        delete=False,
-        prefix=".tmp_",
-        dir=os.path.dirname(os.path.abspath(path)),
-    ) as dest:
+    try:
+        temp_file = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding=encoding,
+            delete=False,
+            prefix=".tmp_",
+            dir=os.path.dirname(os.path.abspath(path)),
+        )
+    except OSError as err:
+        source.close()
+        # Report the target path, not the name of the temporary file.
+        err.filename = os.fspath(path)
+        raise
+
+    with temp_file as dest:
         dest_path = pathlib.Path(dest.name)
         error = None
 
@@ -191,10 +222,10 @@ def rewrite(
 
             os.replace(dest_path, path)
         except BaseException:
-            dest_path.unlink(missing_ok=True)
+            _discard_temp_file(dest_path)
             raise
     else:
-        dest_path.unlink(missing_ok=True)
+        _discard_temp_file(dest_path)
         raise error from None
 
 
@@ -216,6 +247,10 @@ def set_key(
     modifying a file at a potentially untrusted path. If you don't need this
     protection and need symlinks to be followed, use `follow_symlinks`.
     """
+    if isinstance(dotenv_path, str):
+        dotenv_path = os.path.expanduser(dotenv_path)
+    else:
+        dotenv_path = pathlib.Path(dotenv_path).expanduser()
     if quote_mode not in ("always", "auto", "never"):
         raise ValueError(f"Unknown quote_mode: {quote_mode}")
 
@@ -275,6 +310,10 @@ def unset_key(
     modifying a file at a potentially untrusted path. If you don't need this
     protection and need symlinks to be followed, use `follow_symlinks`.
     """
+    if isinstance(dotenv_path, str):
+        dotenv_path = os.path.expanduser(dotenv_path)
+    else:
+        dotenv_path = pathlib.Path(dotenv_path).expanduser()
     if not os.path.exists(dotenv_path):
         logger.warning("Can't delete from %s - it doesn't exist.", dotenv_path)
         return None, key_to_unset
@@ -350,8 +389,12 @@ def find_dotenv(
     """
     Search in increasingly higher folders for the given file
 
+    A leading `~` in `filename` is expanded to the user's home directory, and
+    an absolute `filename` is returned as is if it exists.
+
     Returns path to the file if found, or an empty string otherwise
     """
+    filename = os.path.expanduser(filename)
 
     def _is_interactive():
         """Decide whether this is running in a REPL or IPython notebook"""
@@ -404,7 +447,8 @@ def load_dotenv(
     """Parse a .env file and then load all the variables found as environment variables.
 
     Parameters:
-        dotenv_path: Absolute or relative path to .env file.
+        dotenv_path: Absolute or relative path to .env file. A leading `~` is
+            expanded to the user's home directory.
         stream: Text stream (such as `io.StringIO`) with .env content, used if
             `dotenv_path` is `None`.
         verbose: Whether to output a warning the .env file is missing.
@@ -458,7 +502,8 @@ def dotenv_values(
     `{"foo": None}`
 
     Parameters:
-        dotenv_path: Absolute or relative path to the .env file.
+        dotenv_path: Absolute or relative path to the .env file. A leading `~` is
+            expanded to the user's home directory.
         stream: `StringIO` object with .env content, used if `dotenv_path` is `None`.
         verbose: Whether to output a warning if the .env file is missing.
         interpolate: Whether to interpolate variables using POSIX variable expansion.
